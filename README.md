@@ -1,127 +1,146 @@
-# tentaclez
+# tentaclez — Ladder Swing Bot
 
-Сигнальный бот для торговли акциями и ETF на Robinhood — **исполнение только руками**.
-Бот сам ничего не покупает: считает индикаторы, шлёт алерты в Telegram, ведёт paper-портфель, считает дивиденды и предлагает как делить прибыль. Когда созреешь до автотрейдинга — слой исполнения подключим через Alpaca, без переписывания.
+Сигнальный бот для свинг-торговли ETF на Robinhood. **Не торгует автоматически** — только присылает алерты «купи $X», «продай Y@Z», ты жмёшь кнопки сам в приложении.
 
-## Зачем это так
+Стратегия — ладдер: упало на `dip%` от последней покупки → сигнал докупить, выросло на `profit%` от точки входа конкретного лота → сигнал зафиксировать. Бот ведёт кэш-пул, считает реализованную прибыль, предлагает реинвест-сплит.
 
-У Robinhood **нет официального API для акций/ETF** в 2026 — только крипта.
-Все «робингуд-боты» в гитхабе лезут в приватный API, что нарушает ToS и **может стоить аккаунта**. Поэтому здесь:
+## Зачем полуавтомат
 
-- **данные** идём за: Finnhub (60 req/min free) + yfinance (бэкап/история),
-- **исполнение** делаешь руками в приложении Robinhood,
-- **позиции** записываешь в бот командами `/add` / `/sell`.
+У Robinhood **нет публичного API для акций/ETF** в 2026 (только крипта). Все «робингуд-боты» в гитхабе ломятся в приватный API, что нарушает ToS и **рискует блокировкой аккаунта**. Поэтому бот работает с тобой в паре:
 
-## Что уже умеет (v0.1)
+- **данные** — yfinance (бесплатно, без ключа),
+- **исполнение** — ты руками в приложении Robinhood,
+- **состояние** — пишешь в бот командами `/buy`, `/sell`, `/cash`.
 
-- Считает по watchlist индикаторы: **RSI, MACD, SMA-кросс 50/200, Bollinger, ATR**.
-- Композитный скор `[-100..+100]` → BUY/SELL/HOLD по порогам в `config.yaml`.
-- ATR-стоп и тейк, разумный размер позиции в долларах (учитывает fractional shares).
-- Учитывает **расписание NYSE** (праздники, half-days) — вне сессии тиков нет.
-- **Дивидендный модуль**: добавляет к скору если ex-date близко, отдельная команда `/divcal`.
-- **Paper-портфель** в SQLite (FIFO-матчинг, реализованная P&L).
-- **Профит-сплит**: при `/sell` с прибылью бот предлагает разнести: % в core ETF, % в дивидендник, % в кэш.
-- Утренний бриф и вечернее ресюме в Telegram.
+Когда созреешь до полной автоматизации — слой исполнения подключается через Alpaca/IBKR/Tradier, без переписывания.
+
+## Стратегия (lader swing)
+
+```
+buy_priceₙ  = last_buy_price × (1 - dip_percent)
+sell_priceₙ = buy_priceₙ × (1 + profit_percent)
+```
+
+Пример с `dip=2%`, `profit=4%`:
+
+- последняя покупка QQQ по $500 →
+- следующий сигнал BUY при $490 (-2%) →
+- этот лот получает свой target $509.60 (+4%) →
+- цена дошла до $509.60 → SELL этого лота, выручка падает в `free_cash` →
+- 80% выручки идёт обратно в торговый пул, 20% — на дивидендный ETF (SCHD/JEPI), пропорции в конфиге.
+
+Каждый лот живёт со **своей** target-ценой — поэтому когда у тебя несколько ступенек открытых одновременно, они закрываются независимо по мере того, как цена их догоняет.
+
+## Что уже умеет (v0.2)
+
+- Ladder-движок по QQQ + XLE (тикеры и проценты — в `config.yaml`).
+- Per-ticker `dip_percent` / `profit_percent`, можно править на лету через `/set`.
+- Цены через **yfinance** (без ключа), TTL-кэш 30 сек, ретраи с exponential backoff.
+- Расписание NYSE: проверки идут только в торговую сессию (праздники/half-days учтены).
+- SQLite-портфель: лоты с индивидуальными target-ценами, FIFO-матчинг при продаже, реализованная P&L.
+- Кэш-пул `free_cash` обновляется автоматически: `/buy` уменьшает, `/sell` увеличивает.
+- Профит-сплит при `/sell` с прибылью: 80% обратно в кэш, 20% — рекомендация в дивидендник.
+- Telegram-команды + утренний бриф с ladder-анкорами + вечернее ресюме.
+- Юнит-тесты на стратегию (8 кейсов, проходят).
 
 ## Чего пока нет (специально)
 
-- Авто-исполнение, реальные ордера. Будет в v0.2 через Alpaca paper, потом live.
-- Опционы, маржа, шорты. Не нужны для accumulation-стратегии.
-- ML/LLM. Сначала прозрачные правила, потом — слой объяснения через Claude API.
-- Бэктест. Идёт следующим в roadmap.
+- Авто-исполнение реальных ордеров (v0.3 через Alpaca paper, потом live).
+- Аналитика рынка (SMA200-фильтр, VIX-gate, ATR). На капитал $50–200 это шум-фильтр без альфы — оставлено в config-блоке `analytics.enabled: false` под включение позже.
+- Бэктест-CLI. Идёт следующим.
+- Графики/отчёты, экспорт CSV — секция 7 ТЗ.
 
 ## Запуск за 5 минут
 
-### 1. Получи ключи
+### 1. Получи Telegram-токен
 
-- **Finnhub** — зарегистрируйся на https://finnhub.io, скопируй API key (free tier).
-- **Telegram bot** — напиши [@BotFather](https://t.me/BotFather), `/newbot`, скопируй токен. Запусти своего бота, потом открой `https://api.telegram.org/bot<TOKEN>/getUpdates` после `/start` в чате с ботом и скопируй `chat.id`.
+- Напиши [@BotFather](https://t.me/BotFather), `/newbot`, скопируй токен.
+- Запусти своего бота, потом открой `https://api.telegram.org/bot<TOKEN>/getUpdates` и скопируй `chat.id`.
 
-### 2. Настрой конфиги
+### 2. Конфиги
 
 ```bash
-cp .env.example .env          # вставь FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-cp config.yaml.example config.yaml   # поправь watchlist и капитал
+cp .env.example .env                 # вставь TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+cp config.yaml.example config.yaml   # тикеры и пороги уже стоят (QQQ 2/4, XLE 2.5/5)
 ```
 
-### 3. Подними Docker
+### 3. Поднимай Docker
 
 ```bash
 docker compose up --build -d
 docker compose logs -f bot
 ```
 
-В Telegram должен прилететь `🐙 tentaclez online. /help`. Жми `/help`.
+В Telegram должен прилететь `🐙 tentaclez online. /help`.
 
-### 4. Загрузи стартовые позиции
+### 4. Заведи стартовое состояние
 
-Если уже что-то держишь в Robinhood — расскажи боту:
 ```
-/add QQQ 0.1 510.40
-/add XLE 1   85.20
+/cash 50            # сколько реально свободно на счёте
+/buy QQQ 5 510.40   # уже купил $5 QQQ по $510.40 (анкор для ladder)
+/buy XLE 5 85.20
 ```
 
-Дальше `/portfolio` покажет live-стоимость и P&L.
+Дальше `/status` покажет позиции + ladder-анкоры (где будет следующая покупка), `/rules` — текущие пороги.
 
 ## Команды Telegram
 
 | Команда | Что делает |
 |---|---|
-| `/status` | состояние бота |
-| `/watchlist` | конфигурированные тикеры |
-| `/portfolio` | открытые позиции + live P&L |
-| `/add SYMBOL QTY PRICE` | записать ручную покупку |
-| `/sell SYMBOL QTY PRICE` | записать продажу (FIFO), посчитать профит-сплит |
-| `/closed …` | алиас `/sell` |
-| `/divcal` | ex-div календарь по watchlist |
+| `/status` | портфель, кэш, ladder-анкоры, P&L |
+| `/buy SYMBOL AMOUNT_USD PRICE` | записать покупку (сумма в долларах) |
+| `/sell SYMBOL QTY PRICE` | записать продажу (FIFO, профит-сплит при плюсе) |
+| `/cash AMOUNT` | задать кэш (`/cash 50`); `/cash +20` или `/cash -10` — скорректировать |
+| `/rules` | показать текущие пороги по всем тикерам |
+| `/set SYMBOL dip\|profit\|freq VALUE` | поменять параметр в памяти (`2%` или `0.02`) |
+| `/history [N]` | последние N закрытых сделок + ROI |
 | `/help` | справка |
 
-## Логика сигналов (стартовая)
+`/set` правит **в памяти** — переживёт до рестарта. Чтобы зафиксировать — отредактируй `config.yaml`.
+
+## Архитектура
 
 ```
-score = Σ wᵢ · ruleᵢ(price-data)
+src/tentaclez/
+├── __main__.py        # event loop, scheduler, lifecycle
+├── config.py          # pydantic + .env + yaml
+├── market_hours.py    # NYSE расписание, праздники, half-days
+├── price.py           # yfinance wrapper, TTL-кэш, retry
+├── strategy.py        # generate_signal() — ладдерная логика, чистая, тестируемая
+├── engine.py          # SignalRunner: tick / brief / summary
+├── portfolio.py       # SQLAlchemy: Lot, Trade, CashRow, SignalLog
+├── allocator.py       # 80/20 split realized profit
+├── notify.py          # Telegram сообщения
+└── commands.py        # /buy /sell /cash /rules /set /history /status
 
-BUY  если score ≥ buy_threshold
-SELL если score ≤ sell_threshold
-HOLD иначе
+tests/
+└── test_strategy.py   # 8 проверок ladder-логики
 ```
 
-Все веса и пороги — в `config.yaml`. Каждое правило вкладывает понятную причину в alert (`RSI 28 oversold`, `Golden cross 50/200`, `ex-div in 5d` и т.д.).
+Логика стратегии **не зависит от I/O** — берёт `TickerState` (чистые данные), возвращает `LadderSignal`. Это делает её юнит-тестируемой без моков Telegram/SQLite/yfinance.
 
 ## Локальный dev (без Docker)
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e '.[dev]'
+pytest             # стратегические юнит-тесты
 python -m tentaclez
 ```
 
-## Структура
+## Расписание
 
-```
-src/tentaclez/
-├── __main__.py          # вход + apscheduler + жизненный цикл
-├── config.py            # pydantic-конфиги, .env, yaml
-├── market_hours.py      # NYSE расписание, праздники
-├── data/
-│   ├── finnhub.py       # quote, dividends
-│   └── yfinance_src.py  # история для индикаторов
-├── indicators.py        # RSI, MACD, SMA, Bollinger, ATR
-├── signal_engine.py     # композит → BUY/SELL/HOLD
-├── engine.py            # SignalRunner: tick / brief / summary
-├── portfolio.py         # SQLAlchemy: Lot, Trade, SignalLog
-├── allocator.py         # профит-сплит
-├── notify.py            # отправка в Telegram
-└── commands.py          # /add /sell /portfolio /divcal …
-```
+- **Pre-open brief**: каждый рабочий день в 09:00 NY — кэш, анкоры, где будет следующий BUY.
+- **Intraday tick**: каждые 10 минут (настраивается) пока NYSE открыта — проверка ladder-условий, алерты.
+- **Post-close summary**: каждый рабочий день в 16:30 NY — итоги дня по позициям.
 
-## Дальше по плану
+## Дальше по roadmap
 
-- **v0.2**: бэктест-CLI, Alpaca paper-trading как опциональный слой исполнения.
-- **v0.3**: macro-фильтр (VIX, доходность 10y), DCA-режим для core-ETF.
-- **v0.4**: web-дашборд (FastAPI), история сигналов и сделок.
-- **v0.5**: live-исполнение через Alpaca с подтверждением в Telegram.
+- **v0.3**: бэктест-CLI (`python -m tentaclez.backtest --symbol QQQ --from 2023-01-01`).
+- **v0.4**: тренд-фильтр SMA200 + VIX-gate как опциональные слои.
+- **v0.5**: интеграция Alpaca paper, потом live с подтверждением в Telegram.
+- **v0.6**: web-дашборд (FastAPI), графики P&L, сравнение с S&P 500.
 
 ## Отказ от ответственности
 
-Это образовательный инструмент. Сигналы не являются инвестиционным советом. Прибыль не гарантирована, можно потерять часть или всё. Тестируй на бумаге прежде чем рисковать живыми деньгами.
+Учебный инструмент. Сигналы — не инвестиционный совет. Прибыль не гарантирована, можно потерять часть или весь капитал. Тестируй на бумаге, прежде чем рисковать живыми деньгами.

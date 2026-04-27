@@ -3,21 +3,21 @@ from __future__ import annotations
 from telegram import Bot
 from telegram.constants import ParseMode
 
-from .signal_engine import Signal
+from .strategy import LadderSignal
 
 
-def fmt_signal(sig: Signal, bucket: str) -> str:
+def fmt_signal(sig: LadderSignal) -> str:
     icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪️"}.get(sig.action, "•")
-    head = f"{icon} <b>{sig.symbol}</b> [{bucket}]  {sig.action}  score {sig.score:+.0f}"
-    body = [f"price: ${sig.price:.2f}"]
-    if sig.stop is not None:
-        body.append(f"stop: ${sig.stop:.2f}")
-    if sig.target is not None:
-        body.append(f"target: ${sig.target:.2f}")
-    if sig.suggested_position_usd > 0 and sig.action == "BUY":
-        body.append(f"size: ~${sig.suggested_position_usd:.0f}")
-    reasons = "\n".join(f"  • {r}" for r in sig.reasons) or "  (no triggers)"
-    return f"{head}\n{' | '.join(body)}\n{reasons}"
+    head = f"{icon} <b>{sig.symbol}</b> {sig.action}"
+    body: list[str] = []
+    if sig.action == "BUY":
+        body.append(f"buy ~${sig.suggested_amount_usd:.2f} @ ${sig.suggested_price:.2f}")
+        if sig.target_price is not None:
+            body.append(f"sell target ${sig.target_price:.2f}")
+    elif sig.action == "SELL":
+        body.append(f"sell {sig.suggested_qty:g} @ ${sig.suggested_price:.2f}")
+        body.append(f"expected profit ${sig.expected_profit_usd:+.2f}")
+    return head + "\n" + " | ".join(body) + "\n  • " + sig.reason
 
 
 class TelegramNotifier:
@@ -35,5 +35,5 @@ class TelegramNotifier:
             disable_web_page_preview=True,
         )
 
-    async def send_signal(self, sig: Signal, bucket: str) -> None:
-        await self.send(fmt_signal(sig, bucket))
+    async def send_signal(self, sig: LadderSignal) -> None:
+        await self.send(fmt_signal(sig))

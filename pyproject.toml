@@ -1,16 +1,14 @@
 [project]
 name = "tentaclez"
-version = "0.1.0"
-description = "Signal-only trading bot for Robinhood (manual execution) — Telegram alerts, paper portfolio, dividend tracking"
+version = "0.2.0"
+description = "Ladder Swing signal bot for Robinhood ETF investing — manual execution, Telegram alerts"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "PyYAML>=6.0",
     "pandas>=2.2",
     "numpy>=1.26",
-    "pandas-ta>=0.3.14b",
     "yfinance>=0.2.40",
     "pandas-market-calendars>=4.4",
     "APScheduler>=3.10",
@@ -19,6 +17,13 @@ dependencies = [
     "SQLAlchemy>=2.0",
     "aiosqlite>=0.20",
     "tenacity>=8.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
 ]
 
 [project.scripts]
@@ -30,6 +35,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tentaclez"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

@@ -14,7 +14,6 @@ class Env(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    finnhub_api_key: str = Field(default="", alias="FINNHUB_API_KEY")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     database_url: str = Field(
@@ -27,120 +26,84 @@ class Env(BaseSettings):
     config_path: str = Field(default="config.yaml", alias="CONFIG_PATH")
 
 
-class PortfolioCfg(BaseModel):
-    total_capital_usd: float = 100
-    max_position_pct: float = 25
-    min_position_usd: float = 10
+class TickerCfg(BaseModel):
+    """Per-ticker ladder parameters. All fractions, e.g. 0.02 = 2%."""
+
+    symbol: str
+    dip_percent: float = 0.02
+    profit_percent: float = 0.04
+    check_frequency_minutes: int = 10  # ignored at the moment; global schedule wins
+
+
+class TradeSizingCfg(BaseModel):
+    min_trade_pct: float = 0.10  # of free cash
+    max_trade_pct: float = 0.20
+
+    @field_validator("max_trade_pct")
+    @classmethod
+    def _max_ge_min(cls, v: float, info) -> float:
+        mn = info.data.get("min_trade_pct", 0)
+        if v < mn:
+            raise ValueError("max_trade_pct must be >= min_trade_pct")
+        return v
 
 
 class AllocationCfg(BaseModel):
-    reinvest_core_pct: float = 50
-    reinvest_dividend_pct: float = 30
-    cash_buffer_pct: float = 20
+    """When you record a winning /sell, the bot suggests how to split realized profit."""
 
-    @field_validator("cash_buffer_pct")
+    reinvest_trade_pct: float = 80
+    dividend_etf_pct: float = 20
+    dividend_etf_symbols: list[str] = ["SCHD", "JEPI"]
+
+    @field_validator("dividend_etf_pct")
     @classmethod
     def _sum_to_100(cls, v: float, info) -> float:
-        data = info.data
-        total = data.get("reinvest_core_pct", 0) + data.get("reinvest_dividend_pct", 0) + v
+        total = info.data.get("reinvest_trade_pct", 0) + v
         if abs(total - 100) > 0.01:
-            raise ValueError(f"allocation percentages must sum to 100, got {total}")
+            raise ValueError(f"reinvest_trade_pct + dividend_etf_pct must = 100, got {total}")
         return v
 
 
 class ScheduleCfg(BaseModel):
+    """All times in America/New_York."""
+
     pre_open_brief: str = "09:00"
     post_close_summary: str = "16:30"
-    intraday_check_minutes: int = 5
-    dividend_calendar_horizon_days: int = 14
+    intraday_check_minutes: int = 10  # poll cadence during the session
 
 
-class WatchlistCfg(BaseModel):
-    core: list[str] = []
-    growth: list[str] = []
-    dividend: list[str] = []
-    sector: list[str] = []
+class AnalyticsCfg(BaseModel):
+    """Future-extension hooks (per spec section 7). Off by default at small capital."""
 
-    def all_tickers(self) -> list[str]:
-        seen: dict[str, None] = {}
-        for bucket in (self.core, self.growth, self.dividend, self.sector):
-            for t in bucket:
-                seen.setdefault(t.upper(), None)
-        return list(seen)
-
-    def bucket_of(self, ticker: str) -> str:
-        t = ticker.upper()
-        if t in {x.upper() for x in self.core}:
-            return "core"
-        if t in {x.upper() for x in self.growth}:
-            return "growth"
-        if t in {x.upper() for x in self.dividend}:
-            return "dividend"
-        if t in {x.upper() for x in self.sector}:
-            return "sector"
-        return "unknown"
-
-
-class RuleCfg(BaseModel):
-    enabled: bool = True
-    weight: float = 0
-
-
-class RsiRule(RuleCfg):
-    period: int = 14
-    oversold: float = 30
-    overbought: float = 70
-    weight: float = 25
-
-
-class MacdRule(RuleCfg):
-    fast: int = 12
-    slow: int = 26
-    signal: int = 9
-    weight: float = 20
-
-
-class SmaCrossRule(RuleCfg):
-    fast: int = 50
-    slow: int = 200
-    weight: float = 30
-
-
-class BollingerRule(RuleCfg):
-    period: int = 20
-    std: float = 2.0
-    weight: float = 15
-
-
-class DividendCaptureRule(RuleCfg):
-    days_before_exdate: int = 7
-    min_yield_pct: float = 2.0
-    weight: float = 10
-
-
-class SignalsCfg(BaseModel):
-    buy_threshold: float = 40
-    sell_threshold: float = -40
-    rsi: RsiRule = RsiRule()
-    macd: MacdRule = MacdRule()
-    sma_cross: SmaCrossRule = SmaCrossRule()
-    bollinger: BollingerRule = BollingerRule()
-    dividend_capture: DividendCaptureRule = DividendCaptureRule()
-
-
-class RiskCfg(BaseModel):
-    atr_period: int = 14
-    stop_atr_mult: float = 2.0
-    target_atr_mult: float = 3.0
+    enabled: bool = False
+    sma_long_period: int = 200    # if price < SMA200 → tighten or pause buys
+    vix_pause_threshold: float = 30.0
 
 
 class Config(BaseModel):
-    portfolio: PortfolioCfg = PortfolioCfg()
+    tickers: list[TickerCfg] = []
+    sizing: TradeSizingCfg = TradeSizingCfg()
     allocation: AllocationCfg = AllocationCfg()
     schedule: ScheduleCfg = ScheduleCfg()
-    watchlist: WatchlistCfg = WatchlistCfg()
-    signals: SignalsCfg = SignalsCfg()
-    risk: RiskCfg = RiskCfg()
+    analytics: AnalyticsCfg = AnalyticsCfg()
+
+    def ticker(self, symbol: str) -> TickerCfg | None:
+        s = symbol.upper()
+        for t in self.tickers:
+            if t.symbol.upper() == s:
+                return t
+        return None
+
+    def upsert_ticker(self, t: TickerCfg) -> None:
+        s = t.symbol.upper()
+        for i, existing in enumerate(self.tickers):
+            if existing.symbol.upper() == s:
+                self.tickers[i] = t
+                return
+        self.tickers.append(t)
+
+    def watchlist(self) -> list[str]:
+        return [t.symbol.upper() for t in self.tickers]
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:

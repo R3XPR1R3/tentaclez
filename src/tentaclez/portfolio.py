@@ -7,25 +7,28 @@ from sqlalchemy import DateTime, Float, Integer, String, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .strategy import OpenLot
+
 
 class Base(DeclarativeBase):
     pass
 
 
 class Lot(Base):
-    """An open buy lot (FIFO matching when selling)."""
+    """An open buy lot with its individual sell target."""
 
     __tablename__ = "lots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     qty: Mapped[float] = mapped_column(Float)
     entry_price: Mapped[float] = mapped_column(Float)
+    target_price: Mapped[float] = mapped_column(Float)
     entry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     note: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Trade(Base):
-    """Closed trade (realized P&L)."""
+    """Closed trade — realized P&L row."""
 
     __tablename__ = "trades"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -38,15 +41,23 @@ class Trade(Base):
     pnl_usd: Mapped[float] = mapped_column(Float)
 
 
+class CashRow(Base):
+    """Single-row table holding the bot's free cash pool."""
+
+    __tablename__ = "cash"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    free_cash: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SignalLog(Base):
     __tablename__ = "signals"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     action: Mapped[str] = mapped_column(String(8))
-    score: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)
-    reasons: Mapped[str] = mapped_column(String(1024))
+    reason: Mapped[str] = mapped_column(String(1024))
 
 
 @dataclass(slots=True)
@@ -71,12 +82,44 @@ class PortfolioStore:
     async def init(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        # ensure cash row exists
+        async with self._session() as s:
+            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one_or_none()
+            if row is None:
+                s.add(CashRow(id=1, free_cash=0.0, updated_at=_utcnow()))
+                await s.commit()
+
+    # ---- cash ----
+
+    async def get_cash(self) -> float:
+        async with self._session() as s:
+            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
+            return float(row.free_cash)
+
+    async def set_cash(self, value: float) -> float:
+        async with self._session() as s:
+            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
+            row.free_cash = float(value)
+            row.updated_at = _utcnow()
+            await s.commit()
+            return float(row.free_cash)
+
+    async def adjust_cash(self, delta: float) -> float:
+        async with self._session() as s:
+            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
+            row.free_cash = float(row.free_cash) + float(delta)
+            row.updated_at = _utcnow()
+            await s.commit()
+            return float(row.free_cash)
+
+    # ---- lots / trades ----
 
     async def add_lot(
         self,
         symbol: str,
         qty: float,
-        price: float,
+        entry_price: float,
+        target_price: float,
         note: str | None = None,
         at: datetime | None = None,
     ) -> Lot:
@@ -84,7 +127,8 @@ class PortfolioStore:
             lot = Lot(
                 symbol=symbol.upper(),
                 qty=qty,
-                entry_price=price,
+                entry_price=entry_price,
+                target_price=target_price,
                 entry_at=at or _utcnow(),
                 note=note,
             )
@@ -93,9 +137,33 @@ class PortfolioStore:
             await s.refresh(lot)
             return lot
 
-    async def positions(self) -> list[Position]:
+    async def open_lots(self, symbol: str | None = None) -> list[Lot]:
         async with self._session() as s:
-            rows = (await s.execute(select(Lot))).scalars().all()
+            stmt = select(Lot).order_by(Lot.entry_at, Lot.id)
+            if symbol:
+                stmt = stmt.where(Lot.symbol == symbol.upper())
+            return list((await s.execute(stmt)).scalars().all())
+
+    async def open_lots_for_strategy(self, symbol: str) -> list[OpenLot]:
+        rows = await self.open_lots(symbol)
+        return [
+            OpenLot(id=r.id, qty=r.qty, entry_price=r.entry_price, target_price=r.target_price)
+            for r in rows
+        ]
+
+    async def last_buy_price(self, symbol: str) -> float | None:
+        async with self._session() as s:
+            stmt = (
+                select(Lot.entry_price)
+                .where(Lot.symbol == symbol.upper())
+                .order_by(Lot.entry_at.desc(), Lot.id.desc())
+                .limit(1)
+            )
+            row = (await s.execute(stmt)).scalar_one_or_none()
+            return float(row) if row is not None else None
+
+    async def positions(self) -> list[Position]:
+        rows = await self.open_lots()
         agg: dict[str, list[Lot]] = {}
         for lot in rows:
             agg.setdefault(lot.symbol, []).append(lot)
@@ -118,7 +186,10 @@ class PortfolioStore:
     async def close_position(
         self, symbol: str, qty: float, exit_price: float, at: datetime | None = None
     ) -> list[Trade]:
-        """FIFO-match against open lots; record realized trades; return them."""
+        """FIFO match against open lots; record trades; bump free cash by proceeds.
+
+        Returns the trade rows that were created.
+        """
         at = at or _utcnow()
         symbol = symbol.upper()
         closed: list[Trade] = []
@@ -128,7 +199,7 @@ class PortfolioStore:
             lots = (
                 (
                     await s.execute(
-                        select(Lot).where(Lot.symbol == symbol).order_by(Lot.entry_at)
+                        select(Lot).where(Lot.symbol == symbol).order_by(Lot.entry_at, Lot.id)
                     )
                 )
                 .scalars()
@@ -163,13 +234,19 @@ class PortfolioStore:
                 await s.refresh(t)
         return closed
 
+    async def recent_trades(self, limit: int = 10) -> list[Trade]:
+        async with self._session() as s:
+            stmt = select(Trade).order_by(Trade.exit_at.desc()).limit(limit)
+            return list((await s.execute(stmt)).scalars().all())
+
+    # ---- signals log ----
+
     async def log_signal(
         self,
         symbol: str,
         action: str,
-        score: float,
         price: float,
-        reasons: list[str],
+        reason: str,
         at: datetime | None = None,
     ) -> None:
         async with self._session() as s:
@@ -178,9 +255,8 @@ class PortfolioStore:
                     at=at or _utcnow(),
                     symbol=symbol.upper(),
                     action=action,
-                    score=score,
                     price=price,
-                    reasons=" | ".join(reasons)[:1024],
+                    reason=reason[:1024],
                 )
             )
             await s.commit()

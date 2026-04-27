@@ -12,11 +12,11 @@ from loguru import logger
 
 from .commands import build_app
 from .config import Env, load_config
-from .data.finnhub import FinnhubClient
 from .engine import SignalRunner
 from .market_hours import NY
 from .notify import TelegramNotifier
 from .portfolio import PortfolioStore
+from .price import PriceFetcher
 
 
 def _setup_logging(level: str) -> None:
@@ -33,16 +33,16 @@ async def _run() -> None:
     env = Env()
     cfg = load_config()
     _setup_logging(env.log_level)
-    logger.info("tentaclez starting; watchlist: {}", cfg.watchlist.all_tickers())
+    logger.info("tentaclez starting; watchlist: {}", cfg.watchlist())
 
     store = PortfolioStore(env.database_url)
     await store.init()
 
-    finnhub = FinnhubClient(env.finnhub_api_key)
+    prices = PriceFetcher(ttl_seconds=30.0)
     notifier = TelegramNotifier(env.telegram_bot_token, env.telegram_chat_id)
-    runner = SignalRunner(cfg, finnhub, notifier, store)
+    runner = SignalRunner(cfg, prices, notifier, store)
 
-    app = build_app(env.telegram_bot_token, env.telegram_chat_id, cfg, store, finnhub)
+    app = build_app(env.telegram_bot_token, env.telegram_chat_id, cfg, store, prices)
 
     scheduler = AsyncIOScheduler(timezone=NY)
     scheduler.add_job(
@@ -96,7 +96,6 @@ async def _run() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-        await finnhub.aclose()
 
 
 def main() -> None:
