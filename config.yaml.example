@@ -1,0 +1,81 @@
+# Copy to config.yaml and tweak.
+
+portfolio:
+  # Capital you want the bot to plan around. Used for position sizing & alerts.
+  total_capital_usd: 100
+  # Hard cap per ticker (% of total_capital_usd).
+  max_position_pct: 25
+  # Don't emit a buy signal if recommended position size is below this.
+  min_position_usd: 10
+
+allocation:
+  # When you close a winning trade and run /closed, the bot suggests how to split realized profit.
+  # Numbers must sum to 100.
+  reinvest_core_pct: 50      # back into core ETF (growth/index)
+  reinvest_dividend_pct: 30  # into dividend payer
+  cash_buffer_pct: 20        # set aside
+
+schedule:
+  # 24h clock, America/New_York. Half-days handled automatically.
+  pre_open_brief: "09:00"
+  post_close_summary: "16:30"
+  intraday_check_minutes: 5     # how often to evaluate signals during market hours
+  dividend_calendar_horizon_days: 14
+
+watchlist:
+  core:
+    - QQQ
+    - VOO
+  growth:
+    - AAPL
+    - MSFT
+    - NVDA
+  dividend:
+    - SCHD
+    - JEPI
+    - O
+  sector:
+    - XLE   # energy — you mentioned holding this
+
+signals:
+  # Each rule contributes to a composite score [-100..+100]; thresholds drive the alert.
+  buy_threshold: 40
+  sell_threshold: -40
+
+  rsi:
+    enabled: true
+    period: 14
+    oversold: 30
+    overbought: 70
+    weight: 25
+
+  macd:
+    enabled: true
+    fast: 12
+    slow: 26
+    signal: 9
+    weight: 20
+
+  sma_cross:
+    enabled: true
+    fast: 50
+    slow: 200
+    weight: 30   # golden/death cross — strong long-term signal
+
+  bollinger:
+    enabled: true
+    period: 20
+    std: 2.0
+    weight: 15
+
+  dividend_capture:
+    enabled: true
+    days_before_exdate: 7
+    min_yield_pct: 2.0
+    weight: 10
+
+risk:
+  # ATR-based stop / target.
+  atr_period: 14
+  stop_atr_mult: 2.0
+  target_atr_mult: 3.0
