@@ -62,6 +62,20 @@ class SignalLog(Base):
     reason: Mapped[str] = mapped_column(String(1024))
 
 
+class BrokerageLink(Base):
+    """Persists the SnapTrade user-id + user-secret pair across restarts.
+
+    SnapTrade issues these once per registered user. The user-secret is a bearer
+    credential — keep it in your local DB, not in git or logs.
+    """
+
+    __tablename__ = "brokerage_link"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    user_id: Mapped[str] = mapped_column(String(128))
+    user_secret: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 @dataclass(slots=True)
 class Position:
     symbol: str
@@ -146,6 +160,43 @@ class PortfolioStore:
     async def total_cash(self) -> float:
         budgets = await self.all_budgets()
         return sum(budgets.values())
+
+    # ---- brokerage link ----
+
+    async def save_brokerage_link(self, user_id: str, user_secret: str) -> None:
+        async with self._session() as s:
+            row = (
+                await s.execute(select(BrokerageLink).where(BrokerageLink.id == 1))
+            ).scalar_one_or_none()
+            if row is None:
+                s.add(
+                    BrokerageLink(
+                        id=1, user_id=user_id, user_secret=user_secret, created_at=_utcnow()
+                    )
+                )
+            else:
+                row.user_id = user_id
+                row.user_secret = user_secret
+                row.created_at = _utcnow()
+            await s.commit()
+
+    async def get_brokerage_link(self) -> tuple[str, str] | None:
+        async with self._session() as s:
+            row = (
+                await s.execute(select(BrokerageLink).where(BrokerageLink.id == 1))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return row.user_id, row.user_secret
+
+    async def clear_brokerage_link(self) -> None:
+        async with self._session() as s:
+            row = (
+                await s.execute(select(BrokerageLink).where(BrokerageLink.id == 1))
+            ).scalar_one_or_none()
+            if row is not None:
+                await s.delete(row)
+                await s.commit()
 
     # ---- lots / trades ----
 

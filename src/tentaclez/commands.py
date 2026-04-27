@@ -11,6 +11,7 @@ from .allocator import split_profit
 from .config import Config, TickerCfg
 from .portfolio import PortfolioStore
 from .price import PriceFetcher
+from .snaptrade import SnapTradeClient
 
 
 def _check_chat(update: Update, allowed_chat_id: str) -> bool:
@@ -24,6 +25,7 @@ def build_app(
     cfg: Config,
     store: PortfolioStore,
     prices: PriceFetcher,
+    snaptrade: SnapTradeClient | None = None,
 ) -> Application:
     app = Application.builder().token(token).build()
 
@@ -46,8 +48,16 @@ def build_app(
     async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await guard(update):
             return
+        rh_block = (
+            "\n<b>robinhood (read-only via SnapTrade)</b>\n"
+            "/connect — link your Robinhood account (one-time browser tap)\n"
+            "/rh — show live RH accounts + positions\n"
+            "/disconnect — clear the stored link"
+            if snaptrade is not None
+            else ""
+        )
         await update.message.reply_text(
-            "<b>commands</b>\n"
+            "<b>core</b>\n"
             "/status — portfolio + budgets + ladder anchors\n"
             "/buy SYMBOL AMOUNT_USD PRICE — record a manual buy ($-amount)\n"
             "/sell SYMBOL QTY PRICE — record a manual sell (FIFO, runs profit split)\n"
@@ -57,7 +67,8 @@ def build_app(
             "/rules — show per-ticker dip/profit thresholds\n"
             "/set SYMBOL PARAM VALUE — change dip|profit|freq for a ticker\n"
             "/history [N] — last N closed trades (default 10)\n"
-            "/help — this message",
+            "/help — this message"
+            + rh_block,
             parse_mode=ParseMode.HTML,
         )
 
@@ -388,4 +399,101 @@ def build_app(
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("history", cmd_history))
+
+    # ---- SnapTrade-backed Robinhood read-only commands ----
+
+    if snaptrade is not None:
+
+        async def cmd_connect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await guard(update):
+                return
+            link = await store.get_brokerage_link()
+            if link is None:
+                user_id = SnapTradeClient.make_user_id()
+                try:
+                    user_secret = await snaptrade.register_user(user_id)
+                except Exception as e:
+                    logger.exception("snaptrade register failed")
+                    await update.message.reply_text(f"snaptrade register failed: {e}")
+                    return
+                await store.save_brokerage_link(user_id, user_secret)
+            else:
+                user_id, user_secret = link
+            try:
+                url = await snaptrade.login_url(user_id, user_secret)
+            except Exception as e:
+                logger.exception("snaptrade login url failed")
+                await update.message.reply_text(f"snaptrade login url failed: {e}")
+                return
+            await update.message.reply_text(
+                "Tap this link → pick <b>Robinhood</b> → sign in. Comes back here when done.\n\n"
+                f'<a href="{url}">connect Robinhood</a>\n\n'
+                "(link is single-use and expires in 5 minutes.)",
+                parse_mode=ParseMode.HTML,
+            )
+
+        async def cmd_rh(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await guard(update):
+                return
+            link = await store.get_brokerage_link()
+            if link is None:
+                await update.message.reply_text(
+                    "no brokerage linked yet. run /connect first."
+                )
+                return
+            user_id, user_secret = link
+            try:
+                accounts = await snaptrade.list_accounts(user_id, user_secret)
+            except Exception as e:
+                logger.exception("snaptrade list_accounts failed")
+                await update.message.reply_text(f"sync failed: {e}")
+                return
+            if not accounts:
+                await update.message.reply_text(
+                    "no brokerage accounts found. did the connect flow finish?"
+                )
+                return
+            lines = ["<b>linked brokerage accounts</b>"]
+            for acc in accounts:
+                lines.append(
+                    f"  {acc.institution} · {acc.name}  cash ${acc.cash:.2f}"
+                )
+                try:
+                    positions = await snaptrade.get_holdings(
+                        user_id, user_secret, acc.account_id
+                    )
+                except Exception as e:
+                    logger.warning("holdings failed for {}: {}", acc.account_id, e)
+                    lines.append(f"    (positions error: {e})")
+                    continue
+                if not positions:
+                    lines.append("    (no positions)")
+                    continue
+                for p in positions:
+                    avg = f"avg ${p.avg_buy_price:.2f}" if p.avg_buy_price else "avg —"
+                    lines.append(
+                        f"    {p.symbol}: {p.qty:g} @ ${p.price:.2f} "
+                        f"= ${p.market_value:.2f}  ({avg})"
+                    )
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+        async def cmd_disconnect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await guard(update):
+                return
+            link = await store.get_brokerage_link()
+            if link is None:
+                await update.message.reply_text("nothing to disconnect.")
+                return
+            user_id, _ = link
+            try:
+                await snaptrade.delete_user(user_id)
+            except Exception as e:
+                logger.warning("snaptrade delete_user failed (will clear locally): {}", e)
+            await store.clear_brokerage_link()
+            await update.message.reply_text("disconnected. /connect to link again.")
+
+        app.add_handler(CommandHandler("connect", cmd_connect))
+        app.add_handler(CommandHandler("rh", cmd_rh))
+        app.add_handler(CommandHandler("disconnect", cmd_disconnect))
+
     return app

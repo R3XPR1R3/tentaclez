@@ -10,7 +10,8 @@
 
 - **данные** — yfinance (бесплатно, без ключа),
 - **исполнение** — ты руками в приложении Robinhood,
-- **состояние** — пишешь в бот командами `/buy`, `/sell`, `/cash`.
+- **состояние** — пишешь в бот командами `/buy`, `/sell`, `/budget`, либо синкаешь читалкой через SnapTrade (см. ниже),
+- **чтение портфеля RH** — опционально через **SnapTrade** (легально, OAuth-style, бесплатно до 5 коннектов).
 
 Когда созреешь до полной автоматизации — слой исполнения подключается через Alpaca/IBKR/Tradier, без переписывания.
 
@@ -35,11 +36,13 @@ sell_priceₙ = buy_priceₙ × (1 + profit_percent)
 
 - Ladder-движок по QQQ + XLE (тикеры и проценты — в `config.yaml`).
 - Per-ticker `dip_percent` / `profit_percent`, можно править на лету через `/set`.
+- **Per-ticker budgets**: у каждого тикера свой кошелёк, чтобы один проседающий QQQ не выжрал кэш, отложенный на XLE-dip.
+- **Опциональный read-only sync с Robinhood через SnapTrade** — `/connect` шлёт в чат ссылку, открываешь в браузере, логинишься в RH у SnapTrade, дальше `/rh` показывает живые позиции и кэш в Telegram.
 - Цены через **yfinance** (без ключа), TTL-кэш 30 сек, ретраи с exponential backoff.
 - Расписание NYSE: проверки идут только в торговую сессию (праздники/half-days учтены).
 - SQLite-портфель: лоты с индивидуальными target-ценами, FIFO-матчинг при продаже, реализованная P&L.
-- Кэш-пул `free_cash` обновляется автоматически: `/buy` уменьшает, `/sell` увеличивает.
-- Профит-сплит при `/sell` с прибылью: 80% обратно в кэш, 20% — рекомендация в дивидендник.
+- `/buy` дебитует бюджет конкретного тикера, `/sell` зачисляет. `/transfer` переливает между бюджетами.
+- Профит-сплит при `/sell` с прибылью: 80% остаётся в бюджете, 20% — готовая команда `/transfer` в дивидендник.
 - Telegram-команды + утренний бриф с ladder-анкорами + вечернее ресюме.
 - Юнит-тесты на стратегию (8 кейсов, проходят).
 
@@ -85,18 +88,47 @@ docker compose logs -f bot
 
 ## Команды Telegram
 
+### Core
+
 | Команда | Что делает |
 |---|---|
-| `/status` | портфель, кэш, ladder-анкоры, P&L |
-| `/buy SYMBOL AMOUNT_USD PRICE` | записать покупку (сумма в долларах) |
-| `/sell SYMBOL QTY PRICE` | записать продажу (FIFO, профит-сплит при плюсе) |
-| `/cash AMOUNT` | задать кэш (`/cash 50`); `/cash +20` или `/cash -10` — скорректировать |
-| `/rules` | показать текущие пороги по всем тикерам |
+| `/status` | портфель, бюджеты, ladder-анкоры, P&L |
+| `/buy SYMBOL AMOUNT_USD PRICE` | записать покупку (сумма в долларах) — дебитует бюджет тикера |
+| `/sell SYMBOL QTY PRICE` | записать продажу (FIFO, профит-сплит при плюсе) — зачисляет бюджет |
+| `/cash` | показать общий cash + разбивку по тикерам |
+| `/budget [SYMBOL [AMOUNT \| +AMOUNT \| -AMOUNT]]` | посмотреть/задать/скорректировать бюджет тикера |
+| `/transfer FROM TO AMOUNT` | переложить кэш между бюджетами тикеров |
+| `/rules` | пороги по всем тикерам |
 | `/set SYMBOL dip\|profit\|freq VALUE` | поменять параметр в памяти (`2%` или `0.02`) |
 | `/history [N]` | последние N закрытых сделок + ROI |
 | `/help` | справка |
 
 `/set` правит **в памяти** — переживёт до рестарта. Чтобы зафиксировать — отредактируй `config.yaml`.
+
+### Robinhood (read-only через SnapTrade, опционально)
+
+Нужны ключи в `.env` (см. ниже). Без них команды просто не показываются в `/help`.
+
+| Команда | Что делает |
+|---|---|
+| `/connect` | первая привязка: бот регистрирует пользователя в SnapTrade и шлёт **одноразовую ссылку** в чат. Тапаешь, выбираешь Robinhood, логинишься у SnapTrade, возвращаешься в Telegram. |
+| `/rh` | живой снимок: счета RH, кэш, текущие позиции с avg-ценой |
+| `/disconnect` | удалить связку |
+
+**Важно**: SnapTrade-через-RH **только чтение**, ордера не выставит (ограничение со стороны Robinhood). На бесплатном тарифе SnapTrade данные обновляются раз в сутки. Этого хватает для свинг-стратегии и проверки что бот не ушёл из синхрона с реальным счётом.
+
+### SnapTrade setup
+
+1. Зарегься на https://snaptrade.com → developer dashboard.
+2. Создай проект, скопируй `clientId` и `consumerKey`.
+3. Положи в `.env`:
+   ```
+   SNAPTRADE_CLIENT_ID=...
+   SNAPTRADE_CONSUMER_KEY=...
+   ```
+4. `docker compose up --build -d` — бот подхватит.
+5. В Telegram: `/connect` → тапни ссылку → войди в RH у SnapTrade → готово.
+6. Дальше `/rh` в любой момент.
 
 ## Архитектура
 
@@ -108,10 +140,11 @@ src/tentaclez/
 ├── price.py           # yfinance wrapper, TTL-кэш, retry
 ├── strategy.py        # generate_signal() — ладдерная логика, чистая, тестируемая
 ├── engine.py          # SignalRunner: tick / brief / summary
-├── portfolio.py       # SQLAlchemy: Lot, Trade, CashRow, SignalLog
+├── portfolio.py       # SQLAlchemy: Lot, Trade, Budget, BrokerageLink, SignalLog
 ├── allocator.py       # 80/20 split realized profit
 ├── notify.py          # Telegram сообщения
-└── commands.py        # /buy /sell /cash /rules /set /history /status
+├── snaptrade.py       # read-only Robinhood sync (optional)
+└── commands.py        # /buy /sell /budget /rules /set /history /status /connect /rh
 
 tests/
 └── test_strategy.py   # 8 проверок ladder-логики

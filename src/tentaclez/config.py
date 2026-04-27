@@ -24,6 +24,8 @@ class Env(BaseSettings):
     )
     tz: str = Field(default="America/New_York", alias="TZ")
     config_path: str = Field(default="config.yaml", alias="CONFIG_PATH")
+    snaptrade_client_id: str = Field(default="", alias="SNAPTRADE_CLIENT_ID")
+    snaptrade_consumer_key: str = Field(default="", alias="SNAPTRADE_CONSUMER_KEY")
 
 
 class TickerCfg(BaseModel):

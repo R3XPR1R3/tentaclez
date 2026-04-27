@@ -17,6 +17,7 @@ from .market_hours import NY
 from .notify import TelegramNotifier
 from .portfolio import PortfolioStore
 from .price import PriceFetcher
+from .snaptrade import SnapTradeClient
 
 
 def _setup_logging(level: str) -> None:
@@ -55,7 +56,24 @@ async def _run() -> None:
     notifier = TelegramNotifier(env.telegram_bot_token, env.telegram_chat_id)
     runner = SignalRunner(cfg, prices, notifier, store)
 
-    app = build_app(env.telegram_bot_token, env.telegram_chat_id, cfg, store, prices)
+    snaptrade: SnapTradeClient | None = None
+    if env.snaptrade_client_id and env.snaptrade_consumer_key:
+        try:
+            snaptrade = SnapTradeClient(
+                env.snaptrade_client_id, env.snaptrade_consumer_key
+            )
+            logger.info("SnapTrade integration enabled")
+        except Exception as e:
+            logger.warning("SnapTrade init failed, RH commands disabled: {}", e)
+            snaptrade = None
+    else:
+        logger.info(
+            "SnapTrade keys not set; /connect /rh /disconnect commands disabled"
+        )
+
+    app = build_app(
+        env.telegram_bot_token, env.telegram_chat_id, cfg, store, prices, snaptrade
+    )
 
     scheduler = AsyncIOScheduler(timezone=NY)
     scheduler.add_job(
