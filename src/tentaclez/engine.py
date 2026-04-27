@@ -32,26 +32,26 @@ class SignalRunner:
             logger.debug("market closed; skipping tick")
             return
 
-        free_cash = await self._store.get_cash()
         for ticker_cfg in self._cfg.tickers:
             try:
-                await self._evaluate_one(ticker_cfg.symbol, free_cash)
+                await self._evaluate_one(ticker_cfg.symbol)
             except Exception as e:
                 logger.warning("eval {} failed: {}", ticker_cfg.symbol, e)
 
-    async def _evaluate_one(self, symbol: str, free_cash: float) -> None:
+    async def _evaluate_one(self, symbol: str) -> None:
         ticker_cfg = self._cfg.ticker(symbol)
         if ticker_cfg is None:
             return
         snap = await self._prices.get(symbol)
         last_buy = await self._store.last_buy_price(symbol)
         open_lots = await self._store.open_lots_for_strategy(symbol)
+        budget = await self._store.get_budget(symbol)
         state = TickerState(
             symbol=symbol.upper(),
             current_price=snap.price,
             last_buy_price=last_buy,
             open_lots=open_lots,
-            free_cash=free_cash,
+            free_cash=budget,
         )
         params = StrategyParams(
             dip_percent=ticker_cfg.dip_percent,
@@ -77,30 +77,28 @@ class SignalRunner:
             self._last_emitted.pop(sig.symbol, None)
 
     async def pre_open_brief(self) -> None:
-        cash = await self._store.get_cash()
+        budgets = await self._store.all_budgets()
+        total = sum(budgets.values())
         msg = [
             "☕️ <b>pre-open brief</b>",
             f"watchlist: {', '.join(self._cfg.watchlist()) or '—'}",
-            f"free cash: ${cash:.2f}",
+            f"total cash: ${total:.2f}",
         ]
         for tcfg in self._cfg.tickers:
+            budget = budgets.get(tcfg.symbol.upper(), 0.0)
             last = await self._store.last_buy_price(tcfg.symbol)
-            if last is None:
-                msg.append(
-                    f"  {tcfg.symbol}: no anchor yet — record a /buy to start the ladder"
-                )
-                continue
-            dip = last * (1 - tcfg.dip_percent)
-            msg.append(
-                f"  {tcfg.symbol}: last ${last:.2f} → next buy ≤ ${dip:.2f} "
-                f"(-{tcfg.dip_percent*100:.1f}%)"
+            anchor = (
+                f"last ${last:.2f} → next buy ≤ ${last * (1 - tcfg.dip_percent):.2f}"
+                if last is not None
+                else "no anchor — /buy to start"
             )
+            msg.append(f"  {tcfg.symbol}: budget ${budget:.2f} | {anchor}")
         await self._notify.send("\n".join(msg))
 
     async def post_close_summary(self) -> None:
         positions = await self._store.positions()
-        cash = await self._store.get_cash()
-        lines = ["🌙 <b>post-close summary</b>", f"free cash: ${cash:.2f}"]
+        total = await self._store.total_cash()
+        lines = ["🌙 <b>post-close summary</b>", f"total cash: ${total:.2f}"]
         if not positions:
             lines.append("no open positions.")
         else:

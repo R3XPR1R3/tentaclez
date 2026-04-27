@@ -36,7 +36,20 @@ async def _run() -> None:
     logger.info("tentaclez starting; watchlist: {}", cfg.watchlist())
 
     store = PortfolioStore(env.database_url)
-    await store.init()
+    await store.init(ensure_symbols=cfg.watchlist())
+
+    # Apply initial_budget_usd from config the first time we see a ticker.
+    # This never overwrites an existing non-zero budget.
+    current_budgets = await store.all_budgets()
+    for tcfg in cfg.tickers:
+        if tcfg.initial_budget_usd is None:
+            continue
+        sym = tcfg.symbol.upper()
+        if current_budgets.get(sym, 0.0) == 0.0:
+            await store.set_budget(sym, tcfg.initial_budget_usd)
+            logger.info(
+                "seeded {} budget with ${:.2f} from config", sym, tcfg.initial_budget_usd
+            )
 
     prices = PriceFetcher(ttl_seconds=30.0)
     notifier = TelegramNotifier(env.telegram_bot_token, env.telegram_chat_id)

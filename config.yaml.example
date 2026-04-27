@@ -2,13 +2,17 @@
 
 # --- Active tickers + per-ticker ladder parameters ---
 # dip_percent / profit_percent are fractions: 0.02 = 2%.
+# initial_budget_usd: one-shot default applied only on first init (never overwrites
+# an existing budget). Set per ticker to split your starting capital.
 tickers:
   - symbol: QQQ
     dip_percent: 0.02
     profit_percent: 0.04
+    initial_budget_usd: 25      # half of a $50 starting kitty
   - symbol: XLE
     dip_percent: 0.025
     profit_percent: 0.05
+    initial_budget_usd: 25
 
 # --- Position sizing as % of free cash ---
 sizing:

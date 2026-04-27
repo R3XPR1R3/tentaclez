@@ -48,10 +48,12 @@ def build_app(
             return
         await update.message.reply_text(
             "<b>commands</b>\n"
-            "/status — portfolio + cash + ladder anchors\n"
+            "/status — portfolio + budgets + ladder anchors\n"
             "/buy SYMBOL AMOUNT_USD PRICE — record a manual buy ($-amount)\n"
             "/sell SYMBOL QTY PRICE — record a manual sell (FIFO, runs profit split)\n"
-            "/cash AMOUNT — set free cash (use a leading + or - to adjust)\n"
+            "/cash — show total cash + per-ticker budget breakdown\n"
+            "/budget [SYMBOL [AMOUNT|+AMOUNT|-AMOUNT]] — view or set a ticker's budget\n"
+            "/transfer FROM TO AMOUNT — move cash between ticker budgets\n"
             "/rules — show per-ticker dip/profit thresholds\n"
             "/set SYMBOL PARAM VALUE — change dip|profit|freq for a ticker\n"
             "/history [N] — last N closed trades (default 10)\n"
@@ -64,14 +66,20 @@ def build_app(
     async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await guard(update):
             return
-        cash = await store.get_cash()
+        budgets = await store.all_budgets()
+        total_cash = sum(budgets.values())
         positions = await store.positions()
-        lines = [f"💰 free cash: <b>${cash:.2f}</b>"]
+        lines = [f"💰 total cash: <b>${total_cash:.2f}</b>"]
+        if budgets:
+            lines.append("budgets:")
+            for sym, amt in sorted(budgets.items()):
+                lines.append(f"  {sym}: ${amt:.2f}")
         if not positions:
-            lines.append("no open positions.")
+            lines.append("\nno open positions.")
         else:
             total_cost = 0.0
             total_market = 0.0
+            pos_lines = ["\n<b>positions</b>:"]
             for p in positions:
                 try:
                     snap = await prices.get(p.symbol)
@@ -84,18 +92,18 @@ def build_app(
                 pnl_pct = (pnl / p.cost_basis * 100) if p.cost_basis else 0
                 total_cost += p.cost_basis
                 total_market += mv
-                lines.append(
-                    f"{p.symbol}: {p.qty:g} @ ${p.avg_price:.2f} → ${live:.2f} "
+                pos_lines.append(
+                    f"  {p.symbol}: {p.qty:g} @ ${p.avg_price:.2f} → ${live:.2f} "
                     f"({'+' if pnl >= 0 else ''}{pnl:.2f} / {pnl_pct:+.1f}%)"
                 )
             total_pnl = total_market - total_cost
             total_pct = (total_pnl / total_cost * 100) if total_cost else 0
-            lines.append(
-                f"\n<b>positions value</b>: ${total_market:.2f} (cost ${total_cost:.2f}, "
+            pos_lines.append(
+                f"  market value ${total_market:.2f} (cost ${total_cost:.2f}, "
                 f"P&L {'+' if total_pnl >= 0 else ''}{total_pnl:.2f} / {total_pct:+.1f}%)"
             )
-            lines.append(f"<b>total equity</b>: ${total_market + cash:.2f}")
-        # next ladder triggers
+            pos_lines.append(f"  <b>equity total</b>: ${total_market + total_cash:.2f}")
+            lines.extend(pos_lines)
         if cfg.tickers:
             lines.append("\n<b>ladder anchors</b>:")
             for t in cfg.tickers:
@@ -142,11 +150,11 @@ def build_app(
             target_price=target,
             at=datetime.now(tz=timezone.utc),
         )
-        new_cash = await store.adjust_cash(-amount_usd)
+        new_budget = await store.adjust_budget(symbol, -amount_usd)
         await update.message.reply_text(
             f"recorded BUY {symbol} ${amount_usd:.2f} @ ${price:.2f} ({qty:.6f} sh)\n"
             f"sell target: ${target:.2f} (+{tcfg.profit_percent*100:.1f}%)\n"
-            f"free cash: ${new_cash:.2f}"
+            f"{symbol} budget: ${new_budget:.2f}"
         )
 
     # ---- /sell ----
@@ -173,43 +181,101 @@ def build_app(
             await update.message.reply_text(f"error: {e}")
             return
         proceeds = qty * price
-        new_cash = await store.adjust_cash(proceeds)
+        new_budget = await store.adjust_budget(symbol, proceeds)
         pnl = sum(t.pnl_usd for t in trades)
         msg = [
             f"recorded SELL {symbol} {qty:g} @ ${price:.2f}",
             f"proceeds: ${proceeds:.2f}  |  realized P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}",
-            f"free cash: ${new_cash:.2f}",
+            f"{symbol} budget: ${new_budget:.2f}",
         ]
         if pnl > 0:
             split = split_profit(pnl, cfg.allocation)
             msg.append("")
             msg.append(split.fmt())
+            if split.to_dividend > 0 and split.dividend_targets:
+                first_target = split.dividend_targets[0]
+                msg.append(
+                    f"\nTo follow the {cfg.allocation.dividend_etf_pct:.0f}% rule: "
+                    f"/transfer {symbol} {first_target} {split.to_dividend:.2f}"
+                )
         await update.message.reply_text("\n".join(msg))
 
-    # ---- /cash ----
+    # ---- /cash (read-only summary) + /budget (set/adjust) + /transfer ----
 
-    async def cmd_cash(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_cash(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await guard(update):
+            return
+        budgets = await store.all_budgets()
+        if not budgets:
+            await update.message.reply_text("no budgets set yet. use /budget SYMBOL AMOUNT")
+            return
+        total = sum(budgets.values())
+        lines = [f"💰 total cash: <b>${total:.2f}</b>"]
+        for sym, amt in sorted(budgets.items()):
+            lines.append(f"  {sym}: ${amt:.2f}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await guard(update):
             return
         if len(ctx.args) == 0:
-            cash = await store.get_cash()
-            await update.message.reply_text(f"free cash: ${cash:.2f}")
+            return await cmd_cash(update, ctx)
+        if len(ctx.args) == 1:
+            symbol = ctx.args[0].upper()
+            amt = await store.get_budget(symbol)
+            await update.message.reply_text(f"{symbol}: ${amt:.2f}")
             return
-        if len(ctx.args) != 1:
-            await update.message.reply_text("usage: /cash AMOUNT  (or +AMOUNT / -AMOUNT to adjust)")
+        if len(ctx.args) != 2:
+            await update.message.reply_text(
+                "usage:\n  /budget SYMBOL AMOUNT — set\n"
+                "  /budget SYMBOL +AMOUNT — add\n"
+                "  /budget SYMBOL -AMOUNT — withdraw"
+            )
             return
-        raw = ctx.args[0].strip()
+        symbol = ctx.args[0].upper()
+        raw = ctx.args[1].strip()
         try:
             value = float(raw)
         except ValueError:
             await update.message.reply_text("amount must be a number")
             return
         if raw.startswith(("+", "-")):
-            new_cash = await store.adjust_cash(value)
-            await update.message.reply_text(f"adjusted by ${value:+.2f} → free cash ${new_cash:.2f}")
+            new_amt = await store.adjust_budget(symbol, value)
+            await update.message.reply_text(
+                f"{symbol} adjusted by ${value:+.2f} → budget ${new_amt:.2f}"
+            )
         else:
-            new_cash = await store.set_cash(value)
-            await update.message.reply_text(f"free cash set to ${new_cash:.2f}")
+            new_amt = await store.set_budget(symbol, value)
+            await update.message.reply_text(f"{symbol} budget set to ${new_amt:.2f}")
+
+    async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await guard(update):
+            return
+        if len(ctx.args) != 3:
+            await update.message.reply_text("usage: /transfer FROM_SYMBOL TO_SYMBOL AMOUNT")
+            return
+        src, dst = ctx.args[0].upper(), ctx.args[1].upper()
+        try:
+            amount = float(ctx.args[2])
+        except ValueError:
+            await update.message.reply_text("amount must be a number")
+            return
+        if amount <= 0:
+            await update.message.reply_text("amount must be positive")
+            return
+        src_budget = await store.get_budget(src)
+        if src_budget < amount:
+            await update.message.reply_text(
+                f"{src} budget is ${src_budget:.2f}, can't transfer ${amount:.2f}"
+            )
+            return
+        new_src = await store.adjust_budget(src, -amount)
+        new_dst = await store.adjust_budget(dst, amount)
+        await update.message.reply_text(
+            f"transferred ${amount:.2f}: {src} → {dst}\n"
+            f"  {src}: ${new_src:.2f}\n"
+            f"  {dst}: ${new_dst:.2f}"
+        )
 
     # ---- /rules ----
 
@@ -317,6 +383,8 @@ def build_app(
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("cash", cmd_cash))
+    app.add_handler(CommandHandler("budget", cmd_budget))
+    app.add_handler(CommandHandler("transfer", cmd_transfer))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("history", cmd_history))

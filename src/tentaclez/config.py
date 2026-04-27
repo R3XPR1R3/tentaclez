@@ -33,6 +33,7 @@ class TickerCfg(BaseModel):
     dip_percent: float = 0.02
     profit_percent: float = 0.04
     check_frequency_minutes: int = 10  # ignored at the moment; global schedule wins
+    initial_budget_usd: float | None = None  # one-shot default applied on first init only
 
 
 class TradeSizingCfg(BaseModel):

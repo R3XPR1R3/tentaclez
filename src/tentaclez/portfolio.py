@@ -41,12 +41,14 @@ class Trade(Base):
     pnl_usd: Mapped[float] = mapped_column(Float)
 
 
-class CashRow(Base):
-    """Single-row table holding the bot's free cash pool."""
+class Budget(Base):
+    """Per-ticker cash budget. Each ticker has its own sandbox so a deep
+    drawdown on one symbol can't drain the cash earmarked for another.
+    """
 
-    __tablename__ = "cash"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    free_cash: Mapped[float] = mapped_column(Float, default=0.0)
+    __tablename__ = "budgets"
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -79,38 +81,71 @@ class PortfolioStore:
             self._engine, expire_on_commit=False
         )
 
-    async def init(self) -> None:
+    async def init(self, ensure_symbols: list[str] | None = None) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        # ensure cash row exists
+        if ensure_symbols:
+            await self._ensure_budgets(ensure_symbols)
+
+    async def _ensure_budgets(self, symbols: list[str]) -> None:
+        """Create a $0 budget row for any ticker that doesn't have one yet."""
         async with self._session() as s:
-            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one_or_none()
+            for symbol in symbols:
+                sym = symbol.upper()
+                existing = (
+                    await s.execute(select(Budget).where(Budget.symbol == sym))
+                ).scalar_one_or_none()
+                if existing is None:
+                    s.add(Budget(symbol=sym, amount_usd=0.0, updated_at=_utcnow()))
+            await s.commit()
+
+    # ---- budgets ----
+
+    async def get_budget(self, symbol: str) -> float:
+        async with self._session() as s:
+            row = (
+                await s.execute(select(Budget).where(Budget.symbol == symbol.upper()))
+            ).scalar_one_or_none()
+            return float(row.amount_usd) if row else 0.0
+
+    async def set_budget(self, symbol: str, value: float) -> float:
+        async with self._session() as s:
+            sym = symbol.upper()
+            row = (
+                await s.execute(select(Budget).where(Budget.symbol == sym))
+            ).scalar_one_or_none()
             if row is None:
-                s.add(CashRow(id=1, free_cash=0.0, updated_at=_utcnow()))
-                await s.commit()
-
-    # ---- cash ----
-
-    async def get_cash(self) -> float:
-        async with self._session() as s:
-            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
-            return float(row.free_cash)
-
-    async def set_cash(self, value: float) -> float:
-        async with self._session() as s:
-            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
-            row.free_cash = float(value)
-            row.updated_at = _utcnow()
+                row = Budget(symbol=sym, amount_usd=float(value), updated_at=_utcnow())
+                s.add(row)
+            else:
+                row.amount_usd = float(value)
+                row.updated_at = _utcnow()
             await s.commit()
-            return float(row.free_cash)
+            return float(row.amount_usd)
 
-    async def adjust_cash(self, delta: float) -> float:
+    async def adjust_budget(self, symbol: str, delta: float) -> float:
         async with self._session() as s:
-            row = (await s.execute(select(CashRow).where(CashRow.id == 1))).scalar_one()
-            row.free_cash = float(row.free_cash) + float(delta)
-            row.updated_at = _utcnow()
+            sym = symbol.upper()
+            row = (
+                await s.execute(select(Budget).where(Budget.symbol == sym))
+            ).scalar_one_or_none()
+            if row is None:
+                row = Budget(symbol=sym, amount_usd=float(delta), updated_at=_utcnow())
+                s.add(row)
+            else:
+                row.amount_usd = float(row.amount_usd) + float(delta)
+                row.updated_at = _utcnow()
             await s.commit()
-            return float(row.free_cash)
+            return float(row.amount_usd)
+
+    async def all_budgets(self) -> dict[str, float]:
+        async with self._session() as s:
+            rows = (await s.execute(select(Budget))).scalars().all()
+            return {r.symbol: float(r.amount_usd) for r in rows}
+
+    async def total_cash(self) -> float:
+        budgets = await self.all_budgets()
+        return sum(budgets.values())
 
     # ---- lots / trades ----
 
